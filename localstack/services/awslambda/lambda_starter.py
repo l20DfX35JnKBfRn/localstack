@@ -5,13 +5,18 @@ from localstack import config
 LOG = logging.getLogger(__name__)
 
 
-def start_lambda(port=None, asynchronous=False):
+def start_lambda(port=None, asynchronous=False, update_listener=None):
     from localstack.services.awslambda import lambda_api
     from localstack.services.infra import start_local_api
 
     port = port or config.service_port("lambda")
     return start_local_api(
-        "Lambda", port, api="lambda", method=lambda_api.serve, asynchronous=asynchronous
+        "Lambda",
+        port,
+        api="lambda",
+        method=lambda_api.serve,
+        asynchronous=asynchronous,
+        listener=update_listener,
     )
 
 
