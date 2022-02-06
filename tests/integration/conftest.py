@@ -5,6 +5,7 @@ See: https://docs.pytest.org/en/6.2.x/fixture.html#conftest-py-sharing-fixtures-
 It is thread/process safe to run with pytest-parallel, however not for pytest-xdist.
 """
 import atexit
+import copy
 import logging
 import multiprocessing as mp
 import os
@@ -13,6 +14,7 @@ import threading
 import time
 
 import pytest
+from botocore.client import BaseClient
 from botocore.history import get_global_history_recorder
 
 from localstack import config
@@ -20,6 +22,7 @@ from localstack.config import is_env_true
 from localstack.constants import ENV_INTERNAL_TEST_RUN
 from localstack.services import infra
 from localstack.utils.common import mkdir, safe_requests
+from localstack.utils.patch import patch
 from tests.integration.test_es import install_async as es_install_async
 from tests.integration.test_opensearch import install_async as opensearch_install_async
 from tests.integration.test_terraform import TestTerraform
@@ -56,7 +59,7 @@ class ApiCallRecorder:
         self.last_event = None
         self.skeletons = set()
         self.calls = list()
-        self.mutex = threading.Lock()
+        self.mutex = threading.RLock()
         atexit.register(self.flush)
 
     def emit(self, event_type, payload, source):
@@ -75,18 +78,18 @@ class ApiCallRecorder:
 
             with self.mutex:
                 self.calls.append(payload)
+                if len(self.calls) > 50:
+                    self.flush()
 
-            if len(self.calls) > 50:
-                self.flush()
         except Exception:
             logger.exception("error while recording API calls")
 
     def flush(self):
-        f = f"calls-{int(time.time())}.pickle"
         with self.mutex:
             if not self.calls:
                 return
             try:
+                f = f"calls-{int(time.time())}.pickle"
                 mkdir(self.dirpath)
                 with open(os.path.join(self.dirpath, f), "wb") as fd:
                     pickle.dump(self.calls, fd)
@@ -95,10 +98,63 @@ class ApiCallRecorder:
                 logger.exception("error while pickling API calls")
 
 
+class ResponseRecorder:
+    def __init__(self, dirpath) -> None:
+        self.dirpath = dirpath
+        self.last_event = None
+        self.skeletons = set()
+        self.calls = list()
+        self.records = list()
+        self.mutex = threading.RLock()
+        atexit.register(self.flush)
+
+    def record(self, service, operation, payload):
+        with self.mutex:
+            payload = copy.deepcopy(payload)
+            del payload["ResponseMetadata"]["HTTPHeaders"]
+            # hack to re-use get_skeleton
+            data = {
+                "service": service,
+                "operation": operation,
+                "params": payload,
+            }
+            skeleton = get_skeleton(data)
+            if skeleton in self.skeletons:
+                return
+            self.skeletons.add(skeleton)
+            self.records.append(data)
+
+            if len(self.records) > 50:
+                self.flush()
+
+    def flush(self):
+        with self.mutex:
+            if not self.records:
+                return
+            try:
+                mkdir(self.dirpath)
+                f = f"responses-{int(time.time())}.pickle"
+                with open(os.path.join(self.dirpath, f), "wb") as fd:
+                    pickle.dump(self.records, fd)
+                    self.records.clear()
+            except Exception:
+                logger.exception("error while pickling API response")
+
+
 get_global_history_recorder().enable()
 get_global_history_recorder().add_handler(
     ApiCallRecorder(os.path.abspath(os.path.join(__file__, "../../../target/api-calls")))
 )
+response_recorder = ResponseRecorder(
+    os.path.abspath(os.path.join(__file__, "../../../target/responses"))
+)
+
+
+@patch(BaseClient._make_api_call)
+def patched_make_api_call(_make_api_call, self, operation_name, api_params):
+    response = _make_api_call(self, operation_name, api_params)
+    response_recorder.record(self._service_model.service_name, operation_name, response)
+    return response
 
 
 @pytest.hookimpl()
