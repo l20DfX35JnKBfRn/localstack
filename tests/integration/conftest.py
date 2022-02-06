@@ -4,18 +4,22 @@ See: https://docs.pytest.org/en/6.2.x/fixture.html#conftest-py-sharing-fixtures-
 
 It is thread/process safe to run with pytest-parallel, however not for pytest-xdist.
 """
+import atexit
 import logging
 import multiprocessing as mp
 import os
+import pickle
 import threading
+import time
 
 import pytest
+from botocore.history import get_global_history_recorder
 
 from localstack import config
 from localstack.config import is_env_true
 from localstack.constants import ENV_INTERNAL_TEST_RUN
 from localstack.services import infra
-from localstack.utils.common import safe_requests
+from localstack.utils.common import mkdir, safe_requests
 from tests.integration.test_es import install_async as es_install_async
 from tests.integration.test_opensearch import install_async as opensearch_install_async
 from tests.integration.test_terraform import TestTerraform
@@ -29,6 +33,72 @@ startup_monitor_event = mp.Event()  # event that can be triggered to start local
 
 # collection of functions that should be executed to initialize tests
 test_init_functions = set()
+
+
+def _skel(value):
+    if isinstance(value, dict):
+        return tuple([(k, _skel(v)) for k, v in value.items()])
+    else:
+        return str(type(value))
+
+
+def get_skeleton(api_request):
+    return (
+        api_request["service"],
+        api_request["operation"],
+        _skel(api_request["params"]),
+    )
+
+
+class ApiCallRecorder:
+    def __init__(self, dirpath) -> None:
+        self.dirpath = dirpath
+        self.last_event = None
+        self.skeletons = set()
+        self.calls = list()
+        self.mutex = threading.Lock()
+        atexit.register(self.flush)
+
+    def emit(self, event_type, payload, source):
+        try:
+            if event_type != "API_CALL":
+                return
+
+            skeleton = get_skeleton(payload)
+            if skeleton in self.skeletons:
+                return
+            self.skeletons.add(skeleton)
+
+            if len(str(payload)) > 100000:
+                # skip request payloads above 100kb
+                return
+
+            with self.mutex:
+                self.calls.append(payload)
+
+            if len(self.calls) > 50:
+                self.flush()
+        except Exception:
+            logger.exception("error while recording API calls")
+
+    def flush(self):
+        f = f"calls-{int(time.time())}.pickle"
+        with self.mutex:
+            if not self.calls:
+                return
+            try:
+                mkdir(self.dirpath)
+                with open(os.path.join(self.dirpath, f), "wb") as fd:
+                    pickle.dump(self.calls, fd)
+                    self.calls.clear()
+            except Exception:
+                logger.exception("error while pickling API calls")
+
+
+get_global_history_recorder().enable()
+get_global_history_recorder().add_handler(
+    ApiCallRecorder(os.path.abspath(os.path.join(__file__, "../../../target/api-calls")))
+)
 
 
 @pytest.hookimpl()
