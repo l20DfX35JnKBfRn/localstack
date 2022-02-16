@@ -92,19 +92,28 @@ def test_parse_request(api_call: ApiCall):
     # this emulates what boto does
     aws_request = to_aws_request(api_call)
     http_request = to_http_request(aws_request)
+    service = get_service_model(api_call["service"])
 
     parser = get_parser(api_call["service"])
     op, parsed = parser.parse(http_request)
 
     assert op.name == api_call["operation"]
 
-    # align parsed and recorded parameters
+    # align parsed parameters
     if parsed is None:
         parsed = {}
-    walk(parsed, delete_none_walker)
-    walk(parsed, delete_utc_walker)
+    walk(
+        parsed, delete_none_walker
+    )  # Remove None fields from the parsed dict (on purpose for our implementations)
+    walk(parsed, delete_utc_walker)  # Remove the timezone from the parsed dict (added on purpose)
 
-    assert parsed == api_call["params"]
+    # align the recorded parameters
+    recorded = api_call["params"]
+    if service.protocol == "query":
+        # Remove empty fields if it's the query protocol, they aren't serialized by botocore
+        walk(recorded, delete_empty_walker)
+
+    assert parsed == recorded
 
 
 def delete_utc_walker(target: Union[dict, list], key: any, value: any) -> bool:
@@ -117,6 +126,18 @@ def delete_utc_walker(target: Union[dict, list], key: any, value: any) -> bool:
                 if value == value_in_list:
                     target[i] = fixed_datetime
 
+    return True
+
+
+def delete_empty_walker(target: Union[dict, list], key: any, value: any) -> bool:
+    if not isinstance(value, (dict, list)) or len(value) > 0:
+        return True
+    if isinstance(target, dict):
+        del target[key]
+        return False
+    elif isinstance(target, list):
+        target.remove(value)
+        return False
     return True
 
 
