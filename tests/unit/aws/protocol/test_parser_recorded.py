@@ -1,3 +1,4 @@
+import io
 import os
 import pickle
 import pprint
@@ -10,12 +11,12 @@ from urllib.parse import urlsplit
 import botocore.client
 import pytest
 from botocore.awsrequest import AWSPreparedRequest
-from werkzeug.datastructures import Headers
 
 from localstack.aws.api import HttpRequest, ServiceRequest
 from localstack.aws.protocol.parser import create_parser
 from localstack.aws.spec import load_service
 from localstack.utils.aws import aws_stack
+from localstack.utils.common import to_str
 
 
 class ApiCall(TypedDict):
@@ -109,6 +110,7 @@ def test_parse_request(api_call: ApiCall):
 
     # align the recorded parameters
     recorded = api_call["params"]
+    walk(recorded, convert_bytes_io)
     if service.protocol == "query":
         # Remove empty fields if it's the query protocol, they aren't serialized by botocore
         walk(recorded, delete_empty_walker)
@@ -125,7 +127,18 @@ def delete_utc_walker(target: Union[dict, list], key: any, value: any) -> bool:
             for i, value_in_list in enumerate(target):
                 if value == value_in_list:
                     target[i] = fixed_datetime
+    return True
 
+
+def convert_bytes_io(target: Union[dict, list], key: any, value: any) -> bool:
+    if isinstance(value, io.BytesIO):
+        data = value.read()
+        if isinstance(target, dict):
+            target[key] = data
+        elif isinstance(target, list):
+            for i, value_in_list in enumerate(target):
+                if value == value_in_list:
+                    target[i] = data
     return True
 
 
@@ -197,14 +210,19 @@ def to_aws_request(api_call: ApiCall) -> AWSPreparedRequest:
 
 def to_http_request(aws_request: AWSPreparedRequest) -> HttpRequest:
     split_url = urlsplit(aws_request.url)
-    headers = Headers()
+    headers = {}
     for k, v in aws_request.headers.items():
-        headers[k] = v
+        headers[k] = to_str(v)
+
+    body = aws_request.body
+    # If we have a BytesIO body, we convert it to a bytes-like object
+    if isinstance(body, io.BytesIO):
+        body = body.read()
 
     return HttpRequest(
         method=aws_request.method,
         path=split_url.path,
         query_string=split_url.query,
         headers=headers,
-        body=aws_request.body,
+        body=body,
     )
