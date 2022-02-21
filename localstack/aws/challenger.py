@@ -32,7 +32,6 @@ class Challenger(Skeleton):
         class_name = service_name + "_api"
         class_name = snake_to_camel_case(class_name)
         module_name = f"localstack.aws.api.{service_name}"
-
         module = importlib.import_module(module_name)
         cls = getattr(module, class_name)
         super(Challenger, self).__init__(load_service(service), cls())
@@ -79,7 +78,8 @@ class MockOperationModel:
 class AsfChallengerListener(AwsApiListener):
     def __init__(self, api: str):
         self.service = load_service(api)
-        module_name = f"localstack.aws.api.{self.service.service_name}"
+        service_name = self.service.service_name.replace("-", "_")
+        module_name = f"localstack.aws.api.{service_name}"
         self.api_module = importlib.import_module(module_name)
         self.api = api
         self.serializer = create_serializer(self.service)
@@ -156,7 +156,9 @@ class AsfChallengerListener(AwsApiListener):
                 if "Error" in parsed_response and "Code" in parsed_response["Error"]:
                     # Create the exception which will be serialized
                     code = parsed_response["Error"]["Code"]
-                    exception_cls = getattr(self.api_module, code)
+                    shape = self.service.shape_for_error_code(code)
+                    exception_class = shape.name
+                    exception_cls = getattr(self.api_module, exception_class)
                     message = parsed_response["Error"].get(
                         "Message", parsed_response["Error"].get("message")
                     )
